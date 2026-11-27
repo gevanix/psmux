@@ -87,3 +87,6 @@ release/
 # OMC / Claude tooling state (not part of the project)
 .omc/
 .claude/
+
+# Agent working area (plans, local notes)
+.agents/
