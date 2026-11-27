@@ -567,6 +567,30 @@ pub(crate) fn frame_hyperlinks_take() -> Vec<HyperlinkRun> {
     FRAME_HYPERLINKS.with(|h| std::mem::take(&mut *h.borrow_mut()))
 }
 
+thread_local! {
+    /// Screen rows (absolute, 0-based) whose current frame contains a
+    /// multi-codepoint grapheme (ZWJ families, VS16 sequences, combining
+    /// marks).  conhost's VT engine re-lays a row when a cursor move lands
+    /// inside it and SPREADS such clusters across cells (measured: a family
+    /// arrives as a lone man plus drifting debris), so the OSC 8 overlay
+    /// must never CUP-write into these rows.  Filled by the post-render
+    /// cluster scan, drained with the hyperlink runs each frame.
+    static FRAME_CLUSTER_ROWS: std::cell::RefCell<Vec<u16>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn frame_cluster_rows_clear() {
+    FRAME_CLUSTER_ROWS.with(|h| h.borrow_mut().clear());
+}
+
+pub(crate) fn frame_cluster_rows_push(y: u16) {
+    FRAME_CLUSTER_ROWS.with(|h| h.borrow_mut().push(y));
+}
+
+pub(crate) fn frame_cluster_rows_contains(y: u16) -> bool {
+    FRAME_CLUSTER_ROWS.with(|h| h.borrow().contains(&y))
+}
+
 /// SGR parameters for a ratatui color as a foreground (`base` 38/foreground)
 /// or background (`base` 48). Returns the numeric params without the leading
 /// `\x1b[` or trailing `m`.
@@ -7877,6 +7901,7 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         }
         // Reset OSC 8 hyperlink runs collected during this frame's render (#361).
         frame_hyperlinks_clear();
+        frame_cluster_rows_clear();
         // What this draw is about to put on screen.  No input is handled until
         // this closure returns, so once it has run this is exactly what the
         // user saw — the value a release must re-report.
@@ -9303,6 +9328,42 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
                 }
             }
 
+            // ── Cluster-bearing lines: emit every cell, every frame ─────
+            // conhost's VT engine folds a ZWJ/VS16 cluster into one glyph
+            // only when it arrives contiguously after printable text; a
+            // cursor move landing directly before the cluster spreads it
+            // across cells, and the next write then overwrites the middle
+            // (measured: a family arrives as a lone man plus drifting
+            // debris, and the real screen diverges from the buffer model
+            // for good - the streaming-emoji ghost rows).  A cursor move
+            // before the cluster is exactly what the diff produces when it
+            // skips an unchanged cell inside the line, so a line holding a
+            // multi-codepoint symbol must leave no holes: force every cell
+            // of that line out, and draw_cells' advance-aware contiguity
+            // streams it as one run.
+            {
+                let buf = f.buffer_mut();
+                let area = buf.area;
+                for y in 0..area.height {
+                    let mut has_cluster = false;
+                    for x in 0..area.width {
+                        let sym = buf[(x, y)].symbol();
+                        if sym.len() > 1 && sym.chars().count() > 1 {
+                            has_cluster = true;
+                            break;
+                        }
+                    }
+                    if has_cluster {
+                        frame_cluster_rows_push(area.y + y);
+                        for x in 0..area.width {
+                            buf[(x, y)].set_diff_option(
+                                ratatui::buffer::CellDiffOption::AlwaysUpdate,
+                            );
+                        }
+                    }
+                }
+            }
+
         })?;
         if client_log_enabled() {
             client_log("draw", &format!("draw OK, render={}us overlays: popup={} confirm={} menu={} display_panes={}",
@@ -9317,7 +9378,16 @@ pub fn run_remote(terminal: &mut Terminal<crate::platform::PsmuxBackend>, input:
         // their screen positions, with cursor save/restore. This is a no-op
         // for the common case (no links), so it does not touch the hot path.
         {
-            let runs = frame_hyperlinks_take();
+            // Rows holding a multi-codepoint cluster must not be CUP-written:
+            // conhost re-lays the row on an in-row cursor move and spreads
+            // the cluster across cells, and the re-written link text then
+            // lands in the middle of it (measured).  Those rows are fully
+            // re-emitted by the draw above (AlwaysUpdate), so skipping the
+            // overlay there costs only the link markup, never the content.
+            let runs: Vec<_> = frame_hyperlinks_take()
+                .into_iter()
+                .filter(|r| !frame_cluster_rows_contains(r.y))
+                .collect();
             if !runs.is_empty() {
                 // Part of the frame (#697): queued behind the cells, with the
                 // cursor hidden, and written in the frame's single write.

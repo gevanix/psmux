@@ -5814,6 +5814,76 @@ pub fn create_writer() -> PsmuxWriter {
     { std::io::stdout() }
 }
 
+#[cfg(test)]
+mod draw_cells_continuity_tests {
+    // Wide glyphs must NOT be followed by a cursor move: the host console
+    // folds a contiguous ZWJ cluster into one cell but tears it apart when
+    // a CUP lands inside it (measured: family -> lone man + drifting
+    // debris).  These tests pin the advance-aware continuity in draw_cells.
+    use super::draw_cells;
+    use ratatui::buffer::Cell;
+
+    const FAMILY: &str = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+
+    fn render(cells: &[(u16, u16, &'static str)]) -> String {
+        let owned: Vec<Cell> = cells.iter().map(|(_, _, s)| Cell::new(s)).collect();
+        let items: Vec<(u16, u16, &Cell)> = cells
+            .iter()
+            .zip(owned.iter())
+            .map(|((x, y, _), c)| (*x, *y, c))
+            .collect();
+        let mut out: Vec<u8> = Vec::new();
+        draw_cells(&mut out, items.into_iter()).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Cursor moves (CUP) in the stream; the trailing SGR resets are `m`-terminated.
+    fn cup_count(out: &str) -> usize {
+        out.match_indices("\x1b[").filter(|(i, _)| out[*i..].contains('H')).count()
+    }
+
+    #[test]
+    fn wide_glyph_follower_is_written_contiguously() {
+        // The exact client shape that tore families: CJK, family, CJK.
+        let out = render(&[(0, 0, "前"), (2, 0, FAMILY), (4, 0, "后")]);
+        assert!(
+            out.contains(&format!("前{FAMILY}后")),
+            "wide glyphs must flow without CUPs between them: {out:?}"
+        );
+        assert_eq!(cup_count(&out), 1, "only the initial positioning: {out:?}");
+    }
+
+    #[test]
+    fn vs16_emoji_follower_is_written_contiguously() {
+        // ✔️ measures 2 under unicode-width 0.2.x, matching conhost's advance.
+        let out = render(&[(0, 0, "✔\u{FE0F}"), (2, 0, "X")]);
+        assert!(out.contains("✔\u{FE0F}X"), "VS16 glyph must flow: {out:?}");
+        assert_eq!(cup_count(&out), 1);
+    }
+
+    #[test]
+    fn combining_sequence_follower_is_written_contiguously() {
+        // e + combining acute advances 1, so the follower at x+1 flows.
+        let out = render(&[(0, 0, "e\u{301}"), (1, 0, "X")]);
+        assert!(out.contains("e\u{301}X"), "combining glyph must flow: {out:?}");
+    }
+
+    #[test]
+    fn narrow_glyph_gap_still_gets_a_cursor_move() {
+        // A at x=0 advances 1; the next changed cell at x=2 is NOT adjacent.
+        let out = render(&[(0, 0, "A"), (2, 0, "B")]);
+        assert!(out.contains("A\x1b[1;3H"), "gap must be repositioned: {out:?}");
+    }
+
+    #[test]
+    fn overlapping_write_still_gets_a_cursor_move() {
+        // A cell inside the previous wide glyph's span must be repositioned,
+        // never written over the tail the terminal already advanced past.
+        let out = render(&[(0, 0, "前"), (1, 0, "X")]);
+        assert!(out.contains("\x1b[1;2HX"), "overlap must be repositioned: {out:?}");
+    }
+}
+
 #[cfg(all(test, windows))]
 mod bold_is_bright_tests {
     // Issue #425: crossterm serialises the 16 basic colors as 256-indexed
@@ -6340,11 +6410,23 @@ where
     let mut modifier = Modifier::empty();
     let mut ul_style: u8 = 0;
     let mut last_pos: Option<(u16, u16)> = None;
+    let mut last_advance: u16 = 1;
     for (x, y, cell) in content {
-        if !matches!(last_pos, Some((px, py)) if x == px + 1 && y == py) {
+        // Continuity is judged by the previous glyph's ADVANCE, not by a
+        // +1 cell index: after a two-column glyph the host cursor rests at
+        // x + 2, and the diff's next changed cell is exactly there (the
+        // trailing half of a wide glyph is never emitted).  The old +1
+        // test forced a CUP between every wide glyph and its follower, and
+        // conhost's VT engine tears a ZWJ cluster apart when a cursor move
+        // lands inside it: a family arrives as a lone man plus drifting
+        // debris, the real screen diverges from the buffer model, and the
+        // diff never rewrites the cells it believes unchanged - the stuck
+        // "ghost rows" seen with streaming emoji.
+        if !matches!(last_pos, Some((px, py)) if y == py && x == px + last_advance) {
             queue!(*w, MoveTo(x, y))?;
         }
         last_pos = Some((x, y));
+        last_advance = glyph_advance(cell.symbol());
 
         let cell_modifier = crate::rendering::strip_ul_style(cell.modifier);
         if cell_modifier != modifier {
@@ -6396,6 +6478,18 @@ where
     )?;
     write_underline_color(w, ratatui::style::Color::Reset)?;
     queue!(*w, SetAttribute(CtAttribute::Reset))
+}
+
+/// Columns the host cursor advances past `symbol`, matching how ratatui laid
+/// the cell out: `unicode-width` over the whole grapheme (sequence-aware in
+/// 0.2.x, so a ZWJ family measures 2, a VS16 emoji 2, a combining mark 0),
+/// floored at 1 so an empty or zero-width symbol can never alias the next
+/// cell onto this one.  Underestimating only costs a redundant CUP;
+/// overestimating would leave the next glyph short of its cell, so the
+/// halfwidth-katakana `+1` ratatui adds is deliberately NOT mirrored (those
+/// cells fall back to a safe CUP).
+fn glyph_advance(symbol: &str) -> u16 {
+    (unicode_width::UnicodeWidthStr::width(symbol) as u16).max(1)
 }
 
 /// Writes the SGR 58 underline colour in the COLON subparameter form, and SGR
